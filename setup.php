@@ -9,6 +9,30 @@ require_once ABSPATH . 'wp-admin/includes/media.php';
 require_once ABSPATH . 'wp-admin/includes/file.php';
 require_once ABSPATH . 'wp-admin/includes/image.php';
 
+// The photos are already web-sized, so each one is copied straight into uploads and registered with its
+// size. (media_handle_sideload opens every image, which made the demo slow to build.)
+function sv_sideload( $tmp, $name, $parent, $title ) {
+	$up   = wp_upload_dir();
+	$file = wp_unique_filename( $up['path'], $name );
+	$dest = trailingslashit( $up['path'] ) . $file;
+	if ( ! @rename( $tmp, $dest ) && ! copy( $tmp, $dest ) ) {
+		return new WP_Error( 'sv_copy', 'Could not copy ' . $name );
+	}
+	$type = wp_check_filetype( $file );
+	$size = @getimagesize( $dest ) ?: [ 0, 0 ];
+	$id   = wp_insert_attachment( [ 'post_mime_type' => $type['type'], 'post_title' => $title, 'post_status' => 'inherit', 'guid' => trailingslashit( $up['url'] ) . $file ], $dest, $parent, true, false );
+	if ( is_wp_error( $id ) ) {
+		return $id;
+	}
+	wp_update_attachment_metadata( $id, [ 'width' => $size[0], 'height' => $size[1], 'file' => _wp_relative_upload_path( $dest ), 'sizes' => [], 'image_meta' => [] ] );
+	return $id;
+}
+
+// One transaction for the whole import: SQLite otherwise commits (and syncs to disk) after every query.
+wp_defer_term_counting( true );
+wp_suspend_cache_invalidation( true );
+$wpdb->query( 'START TRANSACTION' );
+
 // Fast demo build: the photos are already web-sized, so skip making thumbnails of each one.
 // (Real hosting can regenerate thumbnails later.)
 if ( defined( 'SV_FAST' ) && SV_FAST ) {
@@ -272,7 +296,7 @@ function sv_attach_images( $pid, $slug, $name ) {
 		$tmp  = wp_tempnam( $base );
 		copy( $file, $tmp );
 		$n   = $num( $file );
-		$att = media_handle_sideload( [ 'name' => $base, 'tmp_name' => $tmp ], $pid, $name . ( $n > 1 ? ' – photo ' . $n : '' ) );
+		$att = sv_sideload( $tmp, $base, $pid, $name . ( $n > 1 ? ' – photo ' . $n : '' ) );
 		if ( ! is_wp_error( $att ) ) $ids[ $n ] = $att;
 	}
 	return $ids; // photo number => attachment id
@@ -336,10 +360,9 @@ foreach ( $products as $order => $d ) {
 
 	$imgs = sv_attach_images( $pid, $d['slug'], $d['name'] );
 	if ( $imgs ) {
-		$p = wc_get_product( $pid );
-		$p->set_image_id( $imgs[1] ?? reset( $imgs ) );
-		$p->set_gallery_image_ids( array_values( array_diff_key( $imgs, [ 1 => true ] ) ) );
-		$p->save();
+		// Written as meta: a second full product save here slowed the import.
+		set_post_thumbnail( $pid, $imgs[1] ?? reset( $imgs ) );
+		update_post_meta( $pid, '_product_image_gallery', implode( ',', array_values( array_diff_key( $imgs, [ 1 => true ] ) ) ) );
 	}
 
 	if ( $variable ) {
@@ -379,3 +402,7 @@ update_option( 'woocommerce_task_list_hidden_lists', [ 'setup', 'extended' ] );
 update_option( 'woocommerce_task_list_complete', 'yes' );
 update_option( 'woocommerce_show_marketplace_suggestions', 'no' );
 update_option( 'woocommerce_admin_install_timestamp', time() - WEEK_IN_SECONDS );
+
+$wpdb->query( 'COMMIT' );
+wp_suspend_cache_invalidation( false );
+wp_defer_term_counting( false );
